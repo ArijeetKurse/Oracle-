@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/*.egg-info/
+backend/build/
+backend/dist/
+backend/oracle.db
+backend/oracle.db-shm
+backend/oracle.db-wal
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+*.py[cod]

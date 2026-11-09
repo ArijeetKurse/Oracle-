@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+launcher=$(readlink -f -- "$0")
+project_root=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd)
+if [ -x "$project_root/backend/.venv/bin/python" ]; then
+    oracle_python="$project_root/backend/.venv/bin/python"
+else
+    oracle_python=$(command -v python3 || command -v python)
+fi
+export ORACLE_PROJECT_ROOT="$project_root"
+export PYTHONPATH="$project_root/backend${PYTHONPATH:+:$PYTHONPATH}"
+exec "$oracle_python" -m oracle.cli "$@"

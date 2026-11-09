@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oracle-local-security"
+version = "0.2.0"
+description = "Local-first Linux security monitoring and investigation"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "psutil>=6,<8",
+  "httpx>=0.27,<1",
+  "pydantic>=2.8,<3",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[project.scripts]
+mrginu = "oracle.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["oracle*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
