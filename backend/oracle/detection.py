@@ -64,7 +64,7 @@ def detect_process_anomalies(sampled_at: float | None = None) -> list[dict]:
                 for endpoint in json.loads(item["connections"] or "[]"):
                     endpoint_counts[endpoint] = endpoint_counts.get(endpoint, 0) + 1
             new_endpoints = sorted(endpoint for endpoint, count in endpoint_counts.items()
-                                   if endpoint not in prior_connections and count >= 2)
+                                   if endpoint not in prior_connections and count >= settings["network_persistence_samples"])
             if new_endpoints:
                 signals.append(("process.new_network_endpoint", "new_remote_endpoints", float(len(new_endpoints)), 0.0,
                                 float(len(new_endpoints)), "A remote endpoint appeared that was not present in this process identity's sampled history."))
@@ -79,8 +79,9 @@ def detect_process_anomalies(sampled_at: float | None = None) -> list[dict]:
                             "baseline_samples": len(prior), "observed_at": row["sampled_at"]}
                 if detector_id == "process.new_network_endpoint": evidence["new_endpoints"] = new_endpoints
                 if extra: evidence.update(extra[0])
-                severity = "medium" if len(signals) > 1 else "low"
-                if detector_id == "process.memory_growth" and deviation >= 100: severity = "medium"
+                severity = "high" if len(signals) >= 3 else "medium" if len(signals) == 2 else "low"
+                if detector_id == "process.memory_growth" and deviation >= 100 and severity == "low": severity="medium"
+                if detector_id == "process.memory_growth" and deviation >= 200 and observed-baseline >= 500*1024*1024: severity="high"
                 created_alert = _persist_alert(conn, now, detector_id, row, metric, observed, expected,
                                                deviation, severity, explanation, evidence, settings["alert_cooldown_seconds"])
                 if created_alert: created.append(created_alert)
@@ -117,7 +118,7 @@ def list_alerts(*, status: str | None = None, severity: str | None = None, pid: 
     for column, value in (("status", status), ("severity", severity), ("pid", pid)):
         if value is not None: clauses.append(f"{column}=?"); values.append(value)
     if since is not None: clauses.append("created_at>=?"); values.append(since)
-    sql = "SELECT * FROM alerts" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at DESC LIMIT ?"
+    sql = "SELECT id,created_at,status,severity,detector_id,dedupe_key,pid,process_create_time,title,explanation,metric,observed_value,expected_value,deviation,confidence,evidence_json,event_id,investigation_id,notified_at,spoken_at,snoozed_until,resolved_at FROM alerts" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at DESC LIMIT ?"
     values.append(max(1, min(500, limit)))
     conn = core.db()
     try:

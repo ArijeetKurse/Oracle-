@@ -22,7 +22,7 @@ def test_database_retention_applies_count_caps(monkeypatch):
     connection=core.db()
     now=datetime.now(timezone.utc)
     connection.executemany('INSERT INTO events VALUES (?,?,?,?)', [(f'e{i}',(now-timedelta(seconds=i)).isoformat(),i,'{}') for i in range(105)])
-    connection.executemany('INSERT INTO investigations VALUES (?,?,?,?)', [(f'i{i}',(now-timedelta(seconds=i)).isoformat(),'COMPLETED','{}') for i in range(55)])
+    connection.executemany('INSERT INTO investigations (id,created_at,status,data) VALUES (?,?,?,?)', [(f'i{i}',(now-timedelta(seconds=i)).isoformat(),'COMPLETED','{}') for i in range(55)])
     connection.commit(); connection.close()
     core.prune_database()
     connection=core.db()

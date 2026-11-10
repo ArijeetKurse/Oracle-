@@ -178,7 +178,10 @@ def collect_resource_sample(processes: Iterable[psutil.Process], *, sampled_at: 
     if include_processes and rows:
         try:
             from .detection import detect_process_anomalies
-            detect_process_anomalies(now)
+            alerts = detect_process_anomalies(now)
+            if alerts:
+                from .alerting import enqueue_alert
+                for alert in alerts: enqueue_alert(alert["id"])
         except Exception:
             logger.exception("Resource anomaly evaluation failed")
     return sample

@@ -34,6 +34,8 @@ def main() -> int:
     try:
         connection = db()
         connection.close()
+        from .alerting import start_workers
+        start_workers()
         collector.start()
         while not stop_event.wait(0.5):
             pass

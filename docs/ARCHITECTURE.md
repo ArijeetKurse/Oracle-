@@ -4,12 +4,12 @@
 explicit `mrginu` invocation
   ├── detached monitor daemon (flock + proc start-time identity)
   │     └── bounded psutil polling → local resource sampler + local heuristic rules → SQLite
-  │            └── event ≥ threshold → deterministic investigation
-  │                   └── bounded queue → optional Groq review
+  │            ├── event ≥ threshold → deterministic investigation → bounded Groq review queue
+  │            └── resource alert → bounded independent investigation / notify-send / Timbre workers
   └── optional `mrginu --dash`
         ├── FastAPI (127.0.0.1:8000) → SQLite and Groq case chat/review
-        └── Vite (127.0.0.1:5173) → React dashboard
-              └── explicit audio upload / report playback → Gnani STT/TTS
+        └── Vite (127.0.0.1:5173) → React dashboard → alert inbox, persisted settings, transcript confirmation
+              └── explicit audio upload / report playback and alert replay → Gnani STT/TTS
 ```
 
 The monitoring daemon is separate from the backend and browser. Its first pass establishes a process baseline; subsequent process identities use `(PID, create_time)` to avoid treating reused PIDs as the same process. It keeps a bounded in-memory identity map and polls at the configured interval. A local resource sampler writes system counters every five seconds by default and a bounded set of process metrics every fifteen seconds. System and process resource samples are stored in additive SQLite tables with timestamp/identity indexes and configurable time retention. Resource reads are served by the loopback API for the dashboard timeline. Heuristics are local and run before optional model analysis. Automatic model reviews have a bounded queue; the collector never waits on a network request.
@@ -18,6 +18,14 @@ SQLite connections use WAL, a busy timeout, indexes, age-based retention, and ev
 
 Investigation inspection is fixed to `psutil` process details, parent details, and network endpoints. The reasoning adapter sends an allowlisted case bundle to Groq; it omits usernames and command lines and redacts usernames embedded in `/home/...` paths. Case chat includes only the selected investigation and four previous turns. No model tool calls or shell execution are enabled. AI report fields are explicitly inference; local heuristic output and collected facts are separate. Groq failures do not replace or invalidate the deterministic report.
 
-`detection.py` evaluates process samples after they are persisted. It waits for the configured baseline count and observation window, compares CPU with a median/MAD-derived bound, requires substantial absolute and relative RSS growth, and requires a newly observed endpoint to persist across multiple samples. It records observed values and baseline details in an additive `alerts` table, deduplicated by detector and process identity during a configured cooldown. Alert state transitions are served by `/api/alerts`; dashboard filters and actions operate on those local records. Alerts are statistical observations, not security verdicts. Native desktop notification delivery, alert-to-investigation linking, proactive speech, and spoken-alert replay are not implemented.
+`detection.py` evaluates process samples after they are persisted. It waits for configured baseline and observation periods, compares CPU with a median/MAD bound, requires substantial absolute and relative RSS growth, and requires a newly observed endpoint to persist. It records observations and baselines in an additive `alerts` table, deduplicated by detector and process identity during cooldown. Corroborating signals can raise severity; one CPU spike remains low. `/api/alerts` serves state and evidence, while the dashboard supplies filtering and lifecycle actions.
+
+The daemon starts independent bounded workers for automatic investigation linking, desktop notifications, and spoken alerts. Investigation linking uses a deterministic event ID derived from the alert ID, a persisted `investigations.event_id`, and an in-process lock; after a crash it checks for an existing investigation before creating one. Resource-alert events record PID plus creation time, and the investigation collector refuses to attach current process details if that PID has been reused. Notification delivery invokes `notify-send` without a shell, uses configured severity and cooldown, and is nonfatal. An optional click action opens the local linked investigation URL when the dashboard is reachable.
+
+Timbre uses a separate bounded worker queue and reuses `_speak_once`, preserving the configured endpoint, auth, model, and WAV validation. `provider_state` in SQLite gives the daemon and API one single-flight lease and persists provider retry time. Rate-limit retries are bounded per alert. Successful WAV bytes are capped at 1 MB per alert, with at most 100 retained clips, and replayed locally. Provider failures never block resource sampling or notification delivery.
+
+The additive schema migration adds event links to existing investigations/alerts, provider coordination state, and spoken retry counters on first database open. Alert retention has both age and hard-count limits; resource history remains time bounded. Existing records are preserved. Alert status transitions are served by `/api/alerts`; settings changes are stored in `app_settings` and shared by daemon/API processes.
 
 Gnani is a separate speech integration: Prisma converts explicitly recorded audio to text, and Timbre converts report text to audio. It is not the reasoning provider. The API is unauthenticated and should remain loopback-only. The demo event is synthetic and remains marked as such.
+
+Prisma's transcription endpoint returns text only; `/api/voice/command` runs only after a separate user confirmation and routes a fixed allowlist (inspect/explain a case or alert, summarize stored resource history, or existing investigation commands). No transcript is passed to a shell. Groq evidence bundles for alert investigations include only capped, allowlisted system/process samples from the alert window, related local events, detector evidence, and explicit history gaps. Groq may return a timeline and safe interpretation, but observations remain separate and unavailable measurements are not filled in.

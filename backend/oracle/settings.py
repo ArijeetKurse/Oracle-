@@ -21,14 +21,20 @@ def defaults() -> dict:
         "max_resource_processes": core.MAX_RESOURCE_PROCESSES,
         "minimum_observation_minutes": int(os.getenv("ORACLE_MINIMUM_OBSERVATION_MINUTES", "2")),
         "minimum_baseline_samples": int(os.getenv("ORACLE_MINIMUM_BASELINE_SAMPLES", "6")),
+        "network_persistence_samples": int(os.getenv("ORACLE_NETWORK_PERSISTENCE_SAMPLES", "2")),
         "cpu_sensitivity": float(os.getenv("ORACLE_CPU_SENSITIVITY", "3.0")),
         "memory_growth_percent": float(os.getenv("ORACLE_MEMORY_GROWTH_PERCENT", "30")),
         "desktop_notifications": os.getenv("ORACLE_DESKTOP_NOTIFICATIONS", "true").lower() not in ("0", "false", "no"),
         "notification_min_severity": os.getenv("ORACLE_NOTIFICATION_MIN_SEVERITY", "high").lower(),
+        "investigation_min_severity": os.getenv("ORACLE_INVESTIGATION_MIN_SEVERITY", "medium").lower(),
         "spoken_alerts": os.getenv("ORACLE_SPOKEN_ALERTS", "false").lower() in ("1", "true", "yes"),
-        "spoken_alert_min_severity": os.getenv("ORACLE_SPOKEN_ALERT_MIN_SEVERITY", "critical").lower(),
+        "spoken_alert_min_severity": os.getenv("ORACLE_SPOKEN_ALERT_MIN_SEVERITY", "high").lower(),
         "voice_muted": False,
         "alert_cooldown_seconds": int(os.getenv("ORACLE_ALERT_COOLDOWN_SECONDS", "300")),
+        "notification_cooldown_seconds": int(os.getenv("ORACLE_NOTIFICATION_COOLDOWN_SECONDS", "300")),
+        "spoken_alert_cooldown_seconds": int(os.getenv("ORACLE_SPOKEN_ALERT_COOLDOWN_SECONDS", "300")),
+        "alert_retention_days": int(os.getenv("ORACLE_ALERT_RETENTION_DAYS", "90")),
+        "max_alerts": int(os.getenv("ORACLE_MAX_ALERTS", "5000")),
         "groq_investigation_reviews": True,
     }
 
@@ -37,7 +43,7 @@ def _validate(name: str, value):
     if name in {"desktop_notifications", "spoken_alerts", "voice_muted", "groq_investigation_reviews"}:
         if type(value) is not bool: raise ValueError(f"{name} must be a boolean")
         return value
-    if name in {"notification_min_severity", "spoken_alert_min_severity"}:
+    if name in {"notification_min_severity", "spoken_alert_min_severity", "investigation_min_severity"}:
         if not isinstance(value,str) or value.lower() not in _SEVERITIES: raise ValueError(f"{name} must be one of {', '.join(_SEVERITIES)}")
         return value.lower()
     if name in {"resource_interval","process_resource_interval","cpu_sensitivity","memory_growth_percent"}:
@@ -47,9 +53,9 @@ def _validate(name: str, value):
         low,high=ranges[name]
         if not low<=value<=high: raise ValueError(f"{name} must be between {low} and {high}")
         return value
-    if name in {"resource_retention_hours","max_resource_processes","minimum_observation_minutes","minimum_baseline_samples","alert_cooldown_seconds"}:
+    if name in {"resource_retention_hours","max_resource_processes","minimum_observation_minutes","minimum_baseline_samples","network_persistence_samples","alert_cooldown_seconds","notification_cooldown_seconds","spoken_alert_cooldown_seconds","alert_retention_days","max_alerts"}:
         if isinstance(value,bool) or not isinstance(value,int): raise ValueError(f"{name} must be an integer")
-        ranges={"resource_retention_hours":(1,720),"max_resource_processes":(1,512),"minimum_observation_minutes":(1,60),"minimum_baseline_samples":(4,100),"alert_cooldown_seconds":(30,3600)}
+        ranges={"resource_retention_hours":(1,720),"max_resource_processes":(1,512),"minimum_observation_minutes":(1,60),"minimum_baseline_samples":(4,100),"network_persistence_samples":(2,3),"alert_cooldown_seconds":(30,3600),"notification_cooldown_seconds":(30,3600),"spoken_alert_cooldown_seconds":(30,3600),"alert_retention_days":(1,3650),"max_alerts":(100,50000)}
         low,high=ranges[name]
         if not low<=value<=high: raise ValueError(f"{name} must be between {low} and {high}")
         return value

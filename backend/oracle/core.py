@@ -32,6 +32,7 @@ class Event(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     pid: int
+    process_create_time: float | None = None
     ppid: int | None = None
     name: str
     executable: str | None = None
@@ -83,7 +84,9 @@ def db():
     conn.execute('PRAGMA busy_timeout=15000')
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, timestamp TEXT, pid INTEGER, data TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, created_at TEXT, status TEXT, data TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, created_at TEXT, status TEXT, data TEXT, event_id TEXT)''')
+    investigation_columns={row['name'] for row in conn.execute('PRAGMA table_info(investigations)').fetchall()}
+    if 'event_id' not in investigation_columns: conn.execute('ALTER TABLE investigations ADD COLUMN event_id TEXT')
     conn.execute('''CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, investigation_id TEXT, created_at TEXT, role TEXT, content TEXT)''')
     # Additive resource-history schema; existing installations migrate on first open.
     conn.execute('''CREATE TABLE IF NOT EXISTS resource_samples (
@@ -108,11 +111,20 @@ def db():
         detector_id TEXT NOT NULL, dedupe_key TEXT NOT NULL, pid INTEGER, process_create_time REAL,
         title TEXT NOT NULL, explanation TEXT NOT NULL, metric TEXT, observed_value REAL,
         expected_value REAL, deviation REAL, confidence REAL NOT NULL, evidence_json TEXT NOT NULL,
-        investigation_id TEXT, notified_at REAL, spoken_at REAL, snoozed_until REAL, resolved_at REAL,
+        event_id TEXT, investigation_id TEXT, notified_at REAL, spoken_at REAL, spoken_attempts INTEGER NOT NULL DEFAULT 0,
+        snoozed_until REAL, resolved_at REAL,
         audio_blob BLOB
+    )''')
+    alert_columns={row['name'] for row in conn.execute('PRAGMA table_info(alerts)').fetchall()}
+    if 'event_id' not in alert_columns: conn.execute('ALTER TABLE alerts ADD COLUMN event_id TEXT')
+    if 'spoken_attempts' not in alert_columns: conn.execute('ALTER TABLE alerts ADD COLUMN spoken_attempts INTEGER NOT NULL DEFAULT 0')
+    conn.execute('''CREATE TABLE IF NOT EXISTS provider_state (
+        provider TEXT PRIMARY KEY, lock_until REAL NOT NULL DEFAULT 0,
+        next_allowed_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0
     )''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_investigations_created ON investigations(created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_investigations_event ON investigations(event_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_investigation ON chat_messages(investigation_id, created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_resource_timestamp ON resource_samples(sampled_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_process_resource_identity ON process_resource_samples(pid, create_time, sampled_at)')
@@ -124,7 +136,7 @@ def db():
 def persist_event(e: Event):
     c=db(); c.execute('INSERT OR REPLACE INTO events VALUES (?,?,?,?)',(e.id,e.timestamp,e.pid,e.model_dump_json())); c.commit(); c.close()
 def persist_investigation(i: Investigation):
-    i.updated_at=datetime.now(timezone.utc).isoformat(); c=db(); c.execute('INSERT OR REPLACE INTO investigations VALUES (?,?,?,?)',(i.id,i.created_at,i.status,i.model_dump_json())); c.commit(); c.close()
+    i.updated_at=datetime.now(timezone.utc).isoformat(); c=db(); c.execute('INSERT OR REPLACE INTO investigations (id,created_at,status,data,event_id) VALUES (?,?,?,?,?)',(i.id,i.created_at,i.status,i.model_dump_json(),i.event_id)); c.commit(); c.close()
 def get_event(id):
     c=db(); row=c.execute('SELECT data FROM events WHERE id=?',(id,)).fetchone(); c.close(); return Event.model_validate_json(row['data']) if row else None
 def list_events(limit=100):
@@ -140,14 +152,19 @@ def prune_database():
     cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
     from .settings import get_settings
     resource_cutoff = datetime.now(timezone.utc).timestamp() - get_settings()["resource_retention_hours"] * 3600
+    alert_settings=get_settings()
+    alert_cutoff=datetime.now(timezone.utc).timestamp()-alert_settings["alert_retention_days"]*86400
     c = db()
-    c.execute('DELETE FROM events WHERE timestamp < ?', (cutoff_iso,))
-    c.execute('DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT ?)', (MAX_EVENTS,))
+    c.execute('DELETE FROM events WHERE timestamp < ? AND id NOT IN (SELECT event_id FROM investigations WHERE event_id IS NOT NULL) AND id NOT IN (SELECT event_id FROM alerts WHERE event_id IS NOT NULL)', (cutoff_iso,))
+    c.execute('DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT ?) AND id NOT IN (SELECT event_id FROM investigations WHERE event_id IS NOT NULL) AND id NOT IN (SELECT event_id FROM alerts WHERE event_id IS NOT NULL)', (MAX_EVENTS,))
     c.execute('DELETE FROM investigations WHERE id NOT IN (SELECT id FROM investigations ORDER BY created_at DESC LIMIT ?)', (MAX_INVESTIGATIONS,))
     c.execute('DELETE FROM chat_messages WHERE investigation_id NOT IN (SELECT id FROM investigations)')
     c.execute('DELETE FROM chat_messages WHERE id NOT IN (SELECT id FROM chat_messages ORDER BY created_at DESC LIMIT 20000)')
     c.execute('DELETE FROM process_resource_samples WHERE sampled_at < ?', (resource_cutoff,))
     c.execute('DELETE FROM resource_samples WHERE sampled_at < ?', (resource_cutoff,))
+    c.execute('DELETE FROM alerts WHERE created_at < ?', (alert_cutoff,))
+    c.execute('DELETE FROM alerts WHERE id NOT IN (SELECT id FROM alerts ORDER BY created_at DESC LIMIT ?)',(alert_settings["max_alerts"],))
+    c.execute('UPDATE alerts SET audio_blob=NULL WHERE id NOT IN (SELECT id FROM alerts WHERE audio_blob IS NOT NULL ORDER BY spoken_at DESC LIMIT 100)')
     c.commit(); c.close()
 
 def list_chat_messages(investigation_id: str, limit: int = 20):
@@ -173,7 +190,9 @@ def inspect_process(pid:int) -> dict:
         endpoints=[]
         for c in conns:
             if c.raddr: endpoints.append(f'{c.raddr.ip}:{c.raddr.port}')
-        return {'pid':pid,'ppid':parent,'name':name,'executable':exe,'connections':sorted(set(endpoints))[:30]}
+        try: created=p.create_time()
+        except psutil.NoSuchProcess: created=None
+        return {'pid':pid,'ppid':parent,'name':name,'executable':exe,'create_time':created,'connections':sorted(set(endpoints))[:30]}
 
 def detect(e: Event) -> Event:
     path=(e.executable or '').lower(); score=0; reasons=[]; rule=[]
@@ -224,6 +243,8 @@ def _review_loop():
 class Collector:
     def __init__(self): self.seen={}; self.running=False; self.thread=None; self._lock=threading.Lock(); self._baseline=True; self._last_prune=0.0; self._last_resource_sample=0.0; self._last_process_resource_sample=0.0
     def snapshot(self):
+        from .settings import get_settings
+        resource_settings=get_settings()
         fresh=[]; alive=set(); resource_processes=[]
         for p in psutil.process_iter(['pid','ppid','name','exe','username']):
             try:
@@ -235,11 +256,11 @@ class Collector:
                 if self._baseline: continue
                 try: conns=sorted({f'{c.raddr.ip}:{c.raddr.port}' for c in p.net_connections(kind='inet') if c.raddr})[:30]
                 except (psutil.AccessDenied, psutil.NoSuchProcess): conns=[]
-                e=detect(Event(pid=d['pid'],ppid=d.get('ppid'),name=d.get('name') or 'unknown',executable=exe,username=d.get('username'),connections=conns))
+                e=detect(Event(pid=d['pid'],process_create_time=created,ppid=d.get('ppid'),name=d.get('name') or 'unknown',executable=exe,username=d.get('username'),connections=conns))
                 persist_event(e); fresh.append(e)
                 if e.risk_score>=35:
                     investigation=create_investigation(e.id, ai_review=False)
-                    queue_investigation_review(investigation.id)
+                    if resource_settings.get("groq_investigation_reviews",True): queue_investigation_review(investigation.id)
             except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError): continue
         self._baseline=False
         self.seen={identity:timestamp for identity,timestamp in self.seen.items() if identity in alive}
@@ -248,8 +269,6 @@ class Collector:
         if time.time()-self._last_prune>3600:
             prune_database(); self._last_prune=time.time()
         monotonic=time.monotonic()
-        from .settings import get_settings
-        resource_settings=get_settings()
         if monotonic-self._last_resource_sample>=resource_settings["resource_interval"]:
             include_processes=monotonic-self._last_process_resource_sample>=resource_settings["process_resource_interval"]
             from .resources import collect_resource_sample
@@ -297,9 +316,12 @@ def create_investigation(event_id:str, *, ai_review:bool=True) -> Investigation:
             persist_investigation(i)
             return i
         d=inspect_process(i.pid)
-        i.evidence.append(Evidence(kind='process_details',source='psutil',detail=json.dumps(d,sort_keys=True),polarity='supporting' if event.risk_score>=35 else 'neutral'))
-        i.actions.append('get_process_connections')
-        i.evidence.append(Evidence(kind='network_connections',source='psutil',detail=json.dumps(d['connections']),polarity='supporting' if d['connections'] and event.rule and 'TEMP' in event.rule else 'neutral'))
+        if event.process_create_time is not None and d.get('create_time') is not None and abs(float(event.process_create_time)-float(d['create_time']))>0.01:
+            i.unknowns.append('The PID now belongs to a different process identity; current process details were not attributed to this alert.')
+        else:
+            i.evidence.append(Evidence(kind='process_details',source='psutil',detail=json.dumps(d,sort_keys=True),polarity='supporting' if event.risk_score>=35 else 'neutral'))
+            i.actions.append('get_process_connections')
+            i.evidence.append(Evidence(kind='network_connections',source='psutil',detail=json.dumps(d['connections']),polarity='supporting' if d['connections'] and event.rule and 'TEMP' in event.rule else 'neutral'))
         i.actions.append('get_parent_process')
         try:
             parent=inspect_process(d['ppid']) if d['ppid'] else None

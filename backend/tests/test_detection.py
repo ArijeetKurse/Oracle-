@@ -47,6 +47,16 @@ def test_new_network_endpoint_alert_is_a_local_observation():
     assert network["evidence"]["new_endpoints"] == ["203.0.113.4:443"]
 
 
+def test_correlated_cpu_memory_and_network_signals_raise_high_severity():
+    seed_process([900,915,930,945,960,975],memory=100_000_000,cpu=2.0,connections=[])
+    seed_process([990],memory=100_000_000,cpu=2.0,connections=["203.0.113.4:443"])
+    seed_process([1005],memory=700_000_000,cpu=80.0,connections=["203.0.113.4:443"])
+    alerts=detection.detect_process_anomalies(1005)
+    assert len(alerts)==3
+    assert {alert["severity"] for alert in alerts}=={"high"}
+    assert all(alert["evidence"]["correlated_signals"]==3 for alert in alerts)
+
+
 def test_alert_state_transition_and_filtering():
     seed_process([900, 915, 930, 945, 960, 975], memory=100_000_000)
     seed_process([990], memory=350_000_000)

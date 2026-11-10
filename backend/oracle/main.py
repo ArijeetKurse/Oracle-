@@ -12,6 +12,8 @@ from .llm import LLMError, provider_settings, answer_question, test_connection
 from . import resources as resource_history_store
 from . import settings as app_settings
 from . import detection as alert_store
+from . import alerting
+from .voice_state import claim_tts_slot, release_tts_slot, tts_ready_at
 
 @asynccontextmanager
 async def lifespan(app):
@@ -23,7 +25,10 @@ app.add_middleware(CORSMiddleware,allow_origins=['http://127.0.0.1:5173','http:/
 _tts_request_active=False
 _logger=logging.getLogger(__name__)
 
-class Command(BaseModel): command:str = Field(min_length=1,max_length=500)
+class Command(BaseModel):
+    command:str = Field(min_length=1,max_length=500)
+    selected_investigation_id:str|None=None
+    selected_alert_id:str|None=None
 class ChatQuestion(BaseModel): question:str = Field(min_length=1,max_length=1200)
 
 @app.get('/api/health')
@@ -59,6 +64,12 @@ def read_alerts(status:str|None=None,severity:str|None=None,pid:int|None=None,li
     if status is not None and status not in {'new','acknowledged','snoozed','resolved'}: raise HTTPException(400,'Invalid alert status.')
     if severity is not None and severity not in {'info','low','medium','high','critical'}: raise HTTPException(400,'Invalid severity.')
     return alert_store.list_alerts(status=status,severity=severity,pid=pid,limit=limit)
+
+@app.get('/api/alerts/{alert_id}/audio')
+def alert_audio(alert_id:str):
+    audio=alerting.replay_audio(alert_id)
+    if audio is None: raise HTTPException(404,'No generated speech is available for this alert.')
+    return Response(content=audio,media_type='audio/wav',headers={'X-Oracle-Speech-Provider':'Gnani Timbre v2.5','Cache-Control':'no-store'})
 
 @app.patch('/api/alerts/{alert_id}')
 def change_alert(alert_id:str,payload:dict):
@@ -122,7 +133,7 @@ def investigate(payload:Command):
             from .core import Event,persist_event,detect
             try:
                 from .core import inspect_process
-                d=inspect_process(pid); event=detect(Event(pid=pid,ppid=d['ppid'],name=d['name'],executable=d['executable'],connections=d['connections'],kind='user_requested'))
+                d=inspect_process(pid); event=detect(Event(pid=pid,process_create_time=d.get('create_time'),ppid=d['ppid'],name=d['name'],executable=d['executable'],connections=d['connections'],kind='user_requested'))
                 persist_event(event)
             except Exception as ex: raise HTTPException(404,f'Cannot inspect PID {pid}: process unavailable or permission denied') from ex
     elif 'suspicious' in payload.command.lower() or 'investigat' in payload.command.lower():
@@ -147,26 +158,82 @@ async def transcribe(audio:UploadFile=File(...),language_code:str=Form('en-IN'))
         r.raise_for_status(); body=r.json()
         if not body.get('success') or not isinstance(body.get('transcript'),str): raise HTTPException(502,'Gnani returned an unsuccessful or unexpected transcription response')
         transcript=body['transcript']
-        return {'transcript':transcript,'provider':'Gnani Prisma v2.5','request_id':body.get('request_id'),'command_result':_route_voice(transcript)}
+        return {'transcript':transcript,'provider':'Gnani Prisma v2.5','request_id':body.get('request_id')}
     except HTTPException: raise
     except httpx.HTTPError as ex: raise HTTPException(502,'Gnani transcription request failed; check API access and try again') from ex
 
-def _route_voice(transcript):
+def _route_voice(transcript,payload:Command|None=None):
     clean=transcript.strip()
     clean=re.sub(r'^\s*oracle[, ]*','',clean,flags=re.I)
     if len(clean)>500: raise HTTPException(400,'Voice transcription is too long. Use a shorter investigation request.')
+    if re.search(r'\b(summarize|summary|what happened|resource history|system history|historical resource)\b',clean,re.I):
+        match=re.search(r'\b(15|5)\s*minutes?\b|\b(last\s+hour|past\s+hour)\b|\b(24\s*hours?|today)\b',clean,re.I)
+        window='5m' if match and match.group(1)=='5' else '15m' if match and match.group(1) else '1h' if match and match.group(2) else '24h' if match and match.group(3) else '15m'
+        data=resource_timeline(window=window)
+        cpu=[sample['cpu_percent'] for sample in data['samples'] if sample.get('cpu_percent') is not None]
+        memory=[sample['memory_percent'] for sample in data['samples'] if sample.get('memory_percent') is not None]
+        net=[(sample.get('network_sent_bps') or 0)+(sample.get('network_recv_bps') or 0) for sample in data['samples']]
+        summary=[f"{len(data['samples'])} recorded system samples in {window}."]
+        if cpu: summary.append(f"CPU ranged from {min(cpu):.1f}% to {max(cpu):.1f}%.")
+        if memory: summary.append(f"RAM utilization ranged from {min(memory):.1f}% to {max(memory):.1f}%.")
+        if net: summary.append(f"Peak combined network throughput was {max(net):.0f} bytes per second.")
+        if not data['samples']: summary.append("No measurements were recorded for that time window; ORACLE cannot reconstruct the missing history.")
+        return {'type':'resource_summary','summary':' '.join(summary),'data':data}
+    if re.search(r'\b(alert|warning)\b',clean,re.I) and re.search(r'\b(explain|inspect|what|show|details)\b',clean,re.I):
+        match=re.search(r'\balert\s+([a-f0-9-]{8,64})\b',clean,re.I)
+        rows=alert_store.list_alerts(limit=500)
+        alert_id=match.group(1) if match else (payload.selected_alert_id if payload else None)
+        alert=next((item for item in rows if item['id']==alert_id),None)
+        if alert is None and payload and payload.selected_investigation_id:
+            alert=next((item for item in rows if item.get('investigation_id')==payload.selected_investigation_id),None)
+        if alert is None and not match: alert=next((item for item in rows if item['status'] in ('new','acknowledged','snoozed')),None)
+        if alert is None: raise HTTPException(404,'No matching alert is available in the local inbox.')
+        if alert.get('investigation_id') and re.search(r'\b(explain|why|cause|what happened)\b',clean,re.I) and provider_settings()['configured']:
+            return _voice_explain(alert['investigation_id'],clean)
+        return {'type':'alert','alert':alert}
+    if re.search(r'\b(explain|inspect|describe)\b.*\binvestigation\b|\bwhat caused this\b|\bwhy was this flagged\b',clean,re.I):
+        match=re.search(r'\binvestigation\s+([a-f0-9-]{8,64})\b',clean,re.I)
+        iid=match.group(1) if match else (payload.selected_investigation_id if payload else None)
+        inv=get_investigation(iid) if iid else None
+        if not inv: raise HTTPException(404,'Select an investigation or include its identifier in the request.')
+        if provider_settings()['configured'] and re.search(r'\b(explain|why|cause|what happened)\b',clean,re.I):
+            return _voice_explain(iid,clean)
+        return {'type':'investigation','investigation':inv.model_dump()}
     if not re.search(r'\b(investigate|inspect|analy[sz]e)\b',clean,re.I): raise HTTPException(400,'Transcription received, but supported voice commands must ask ORACLE to investigate or inspect.')
-    return investigate(Command(command=clean))
+    return {'type':'investigation','investigation':investigate(Command(command=clean))}
+
+
+def _voice_explain(investigation_id:str,question:str)->dict:
+    try:
+        answer=chat(investigation_id,ChatQuestion(question=question))['answer']
+        return {'type':'answer','investigation_id':investigation_id,'answer':answer}
+    except HTTPException as exc:
+        # A provider outage must not prevent opening the local investigation evidence.
+        inv=get_investigation(investigation_id)
+        if inv:
+            return {'type':'investigation','investigation':inv.model_dump(),
+                    'provider_error':str(exc.detail),'fallback':'Opened local evidence; Groq could not answer.'}
+        raise
 @app.post('/api/voice/command')
-def voice_command(payload:Command): return {'transcript':payload.command,'provider':'typed fallback','command_result':_route_voice(payload.command)}
+def voice_command(payload:Command): return {'transcript':payload.command,'provider':'Gnani Prisma confirmed transcript' if payload.selected_investigation_id or payload.selected_alert_id else 'confirmed transcript','command_result':_route_voice(payload.command,payload)}
 @app.post('/api/voice/speak')
 async def speak(payload:Command):
     global _tts_request_active
     if _tts_request_active:
         raise HTTPException(409,'A Timbre synthesis request is already running. Wait for it to finish before starting another.')
+    if not claim_tts_slot():
+        raise HTTPException(429,'Gnani Timbre is busy or in its provider retry window. Wait before requesting speech.',headers={'Retry-After':str(max(1,int(tts_ready_at()-time.time())))})
     _tts_request_active=True
     try:
-        return await _speak_once(payload)
+        response=await _speak_once(payload)
+        release_tts_slot()
+        return response
+    except HTTPException as exc:
+        release_tts_slot(retry_after=exc.headers.get('Retry-After') if exc.headers else None)
+        raise
+    except Exception:
+        release_tts_slot()
+        raise
     finally:
         _tts_request_active=False
 

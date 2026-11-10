@@ -30,13 +30,15 @@ This is periodic user-space monitoring, **not continuous or exhaustive system te
 
 When a local rule gives an event a risk score of at least 35, ORACLE automatically creates a deterministic investigation and collects a limited evidence bundle using `psutil` (process details, visible network connections, and parent details). If a Groq key is configured, the investigation is queued for an optional AI review. The queue is bounded so a slow provider request does not hold up monitoring.
 
+Resource detectors can also create alert records after enough history exists. Eligible medium-or-higher alerts link to a deterministic `resource_anomaly` event and one investigation; both IDs and the process creation time are stored. The daemon retries link work idempotently if it exits during processing. If the PID has since been reused, the new process is not attributed to the old alert. The alert inbox retains observed detector values and exposes the linked investigation.
+
 Groq is used for investigation review and user-requested case chat. It receives an allowlisted bundle for that case; it does not receive a continuous stream of all processes, run tools, or execute commands. Its output is presented as model inference, separate from observed facts and local rules.
 
 Gnani is used for speech features, not as the monitor's decision-maker:
 
-- **Prisma STT** transcribes audio after the user records a voice command. ORACLE accepts supported investigation/inspection requests from the transcript.
-- **Timbre TTS** turns a selected investigation report into audio after the user requests it.
-- Neither service currently starts speaking on its own when the daemon detects an event. ORACLE does not currently provide a persistent spoken conversation or automatically open the microphone.
+- **Prisma STT** transcribes audio after the user deliberately starts recording. ORACLE displays the transcript and waits for a separate confirmation before routing a supported request. The microphone never starts automatically and recording stops after the short capture window.
+- **Timbre TTS** reads a selected report on request and can optionally announce qualifying alerts. Alert speech is synthesized off the collector path, single-flight across API/daemon processes, rate-limited using provider `Retry-After`, and saved locally for replay.
+- Desktop notifications run from the daemon through `notify-send`; they do not require a browser. Clicking an action opens a linked investigation when the dashboard is already available.
 
 ## Other features in the current application
 
@@ -46,6 +48,10 @@ Gnani is used for speech features, not as the monitor's decision-maker:
 - Voice recording can submit an investigation command through Gnani Prisma.
 - A report can be read aloud with Gnani Timbre.
 - Events, investigations, and case chat are stored locally in SQLite, with age and count limits.
+- Medium-or-higher resource alerts can automatically link to one investigation; the relationship is protected against duplicate worker execution and PID reuse.
+- Linux desktop notifications can be delivered while the dashboard is closed. Optional Timbre announcements use a bounded daemon queue and have local mute/threshold controls.
+- Alert replay serves audio generated for that alert; it does not make another provider request.
+- Settings for collection, detection sensitivity, severity thresholds, notification/speech preferences, cooldown, and Groq reviews are saved through the backend in SQLite.
 - The safe demo creates a clearly marked synthetic event; it does not launch a process or contact its example network address.
 - The dashboard includes monitoring controls, process and investigation lists, settings, themes, and provider status.
 - The Resource History section charts actual locally collected CPU, memory, network, and root-disk samples for supported time windows, and lists recent process resource samples.
@@ -61,7 +67,7 @@ mrginu --status     # Check daemon, API, and dashboard status
 mrginu --stop       # Stop ORACLE-managed monitoring and services
 ```
 
-In the dashboard, use **Run safe demo** to explore the workflow with synthetic data. To investigate a real process, enter a PID or use the supported investigation command. You can also record a voice command from **Voice & Settings**. Select a case and choose **Read report** to request audio.
+In the dashboard, use **Run safe demo** to explore the workflow with synthetic data. To investigate a real process, enter a PID or use the supported investigation command. In **Voice & Settings**, deliberately record a request, review the transcription, and click **Confirm voice command** to continue. Choose **Read report** for interactive TTS; enable spoken alert preferences there to opt into queued alert speech.
 
 Choose **Resources** to inspect recent system samples and the process samples collected since monitoring started.
 
@@ -77,10 +83,10 @@ The API and dashboard bind to loopback (`127.0.0.1`) and the API has no user aut
 
 ORACLE aims to make local Linux security signals easier to notice and investigate. It combines lightweight background process observation, transparent local rules, a saved evidence trail, and optional AI explanations in one local-first workflow. It is an investigation aid, not a complete endpoint detection system and not proof that a process is malicious.
 
-## Resource history and alerting status
+## Resource history and alerting
 
 The daemon now samples system resources every five seconds by default and up to 64 selected processes every fifteen seconds. The SQLite history is bounded by a 24-hour default retention period. The Resources view charts actual recorded CPU, memory, and network counters and can show sampled process history. Older history cannot be reconstructed retroactively.
 
-The Alert inbox stores local, explainable statistical observations after a per-process baseline is available. CPU deviation, material RSS growth, and persistent newly observed endpoints are supported. Alerts include baseline evidence and can be acknowledged, snoozed, or resolved. A high CPU value alone does not mean malware.
+The Alert inbox stores local, explainable statistical observations after a per-process baseline is available. CPU deviation, material RSS growth, and persistent newly observed endpoints are supported. Alerts include baseline evidence and can be acknowledged, snoozed, or resolved. Medium-and-higher alerts can link to an investigation and deterministic event. The daemon independently handles desktop notification and optional Timbre queues; high severity requires corroboration or very large memory growth. A high CPU value alone does not mean malware.
 
-Not yet implemented: process-tree change detectors, alerts linked to automatically created investigations, desktop notifications, proactive Timbre announcements, alert replay, and follow-up voice commands. Existing user-initiated Prisma transcription and Timbre report reading remain separate manual features. Groq still reviews investigation evidence; it does not get continuous telemetry. These boundaries are intentional in the current implementation and must not be mistaken for features already running.
+Still not implemented: process-tree anomaly detectors, restart-loop detection, a continuously open conversation, audio volume control from the daemon, and automatic remediation. Prisma remains user-initiated. Groq reviews only a linked case's allowlisted observations, never continuous telemetry. Desktop notifications depend on a session notification service such as `notify-send`; if it is absent, the alert stays in SQLite and the dashboard inbox.
