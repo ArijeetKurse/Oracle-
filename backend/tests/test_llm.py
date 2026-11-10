@@ -10,6 +10,14 @@ def response(content: str) -> httpx.Response:
     return httpx.Response(200, json={"choices": [{"message": {"content": content}}]}, request=httpx.Request("POST", llm.BASE_URL))
 
 
+def error_response(status: int) -> httpx.Response:
+    return httpx.Response(
+        status,
+        json={"error": {"message": "mock failure with test-secret-key and sensitive request data"}},
+        request=httpx.Request("POST", llm.BASE_URL),
+    )
+
+
 def test_groq_default_model_and_environment_override(monkeypatch):
     monkeypatch.delenv("GROQ_MODEL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
@@ -46,6 +54,82 @@ def test_groq_missing_key_is_clear(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     with pytest.raises(llm.LLMError, match="GROQ_API_KEY"):
         llm.test_connection()
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "rejected the request"),
+        (401, "rejected the API credentials"),
+        (403, "denied access"),
+        (404, "could not find model"),
+        (429, "rate limit"),
+        (500, "temporarily unavailable"),
+        (502, "temporarily unavailable"),
+        (503, "temporarily unavailable"),
+    ],
+)
+def test_groq_provider_statuses_are_clear_and_sanitized(monkeypatch, status, message):
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret-key")
+    monkeypatch.setattr(llm.httpx, "post", lambda *args, **kwargs: error_response(status))
+
+    with pytest.raises(llm.LLMError) as error:
+        llm.test_connection()
+
+    assert error.value.provider_status_code == status
+    assert error.value.http_status_code == 502
+    assert message in str(error.value)
+    assert "test-secret-key" not in str(error.value)
+    assert "sensitive request data" not in str(error.value)
+
+
+def test_groq_connection_test_parses_success(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret-key")
+    monkeypatch.setenv("GROQ_MODEL", "test-model")
+    monkeypatch.setattr(llm.httpx, "post", lambda *args, **kwargs: response("ORACLE connection test passed."))
+
+    result = llm.test_connection()
+
+    assert result == {
+        "ok": True,
+        "provider": "groq",
+        "model": "test-model",
+        "message": "ORACLE connection test passed.",
+    }
+
+
+def test_groq_unexpected_success_shape_is_a_gateway_error(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret-key")
+    malformed = httpx.Response(200, json={"choices": []}, request=httpx.Request("POST", llm.BASE_URL))
+    monkeypatch.setattr(llm.httpx, "post", lambda *args, **kwargs: malformed)
+
+    with pytest.raises(llm.LLMError) as error:
+        llm.test_connection()
+
+    assert "unexpected response" in str(error.value)
+    assert error.value.http_status_code == 502
+
+
+@pytest.mark.parametrize(
+    ("exception", "message"),
+    [
+        (httpx.TimeoutException("request includes test-secret-key"), "did not respond"),
+        (httpx.ConnectError("request includes test-secret-key"), "Could not connect"),
+    ],
+)
+def test_groq_transport_errors_are_sanitized(monkeypatch, exception, message):
+    monkeypatch.setenv("GROQ_API_KEY", "test-secret-key")
+
+    def fail(*args, **kwargs):
+        raise exception
+
+    monkeypatch.setattr(llm.httpx, "post", fail)
+    with pytest.raises(llm.LLMError) as error:
+        llm.test_connection()
+
+    assert message in str(error.value)
+    assert error.value.http_status_code == 503
+    assert "test-secret-key" not in str(error.value)
 
 
 def test_monitoring_review_queue_skips_llm_without_key(monkeypatch):

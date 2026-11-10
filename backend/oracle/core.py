@@ -23,6 +23,10 @@ EVENT_RETENTION_DAYS = max(1, int(os.getenv('ORACLE_EVENT_RETENTION_DAYS', '30')
 MAX_EVENTS = max(100, int(os.getenv('ORACLE_MAX_EVENTS', '10000')))
 MAX_INVESTIGATIONS = max(50, int(os.getenv('ORACLE_MAX_INVESTIGATIONS', '2000')))
 MAX_SEEN_IDENTITIES = 50000
+RESOURCE_SAMPLE_INTERVAL = max(1.0, float(os.getenv('ORACLE_RESOURCE_INTERVAL', '5')))
+PROCESS_RESOURCE_SAMPLE_INTERVAL = max(RESOURCE_SAMPLE_INTERVAL, float(os.getenv('ORACLE_PROCESS_RESOURCE_INTERVAL', '15')))
+RESOURCE_RETENTION_HOURS = max(1, int(os.getenv('ORACLE_RESOURCE_RETENTION_HOURS', '24')))
+MAX_RESOURCE_PROCESSES = max(1, min(512, int(os.getenv('ORACLE_MAX_RESOURCE_PROCESSES', '64'))))
 
 class Event(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -81,9 +85,40 @@ def db():
     conn.execute('''CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, timestamp TEXT, pid INTEGER, data TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, created_at TEXT, status TEXT, data TEXT)''')
     conn.execute('''CREATE TABLE IF NOT EXISTS chat_messages (id TEXT PRIMARY KEY, investigation_id TEXT, created_at TEXT, role TEXT, content TEXT)''')
+    # Additive resource-history schema; existing installations migrate on first open.
+    conn.execute('''CREATE TABLE IF NOT EXISTS resource_samples (
+        sampled_at REAL PRIMARY KEY, timestamp TEXT NOT NULL, interval_seconds REAL NOT NULL,
+        cpu_percent REAL, memory_percent REAL, memory_total INTEGER, memory_used INTEGER, memory_available INTEGER,
+        swap_percent REAL, swap_total INTEGER, swap_used INTEGER, disk_percent REAL,
+        disk_read_bytes INTEGER, disk_write_bytes INTEGER, disk_read_bps REAL, disk_write_bps REAL,
+        network_sent_bytes INTEGER, network_recv_bytes INTEGER, network_sent_bps REAL, network_recv_bps REAL,
+        uptime_seconds REAL, process_count INTEGER NOT NULL DEFAULT 0
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS process_resource_samples (
+        sampled_at REAL NOT NULL, pid INTEGER NOT NULL, create_time REAL NOT NULL,
+        name TEXT NOT NULL, executable TEXT, cpu_percent REAL, memory_rss INTEGER,
+        memory_percent REAL, thread_count INTEGER, open_fds INTEGER, connections TEXT,
+        PRIMARY KEY (sampled_at, pid, create_time)
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS alerts (
+        id TEXT PRIMARY KEY, created_at REAL NOT NULL, status TEXT NOT NULL, severity TEXT NOT NULL,
+        detector_id TEXT NOT NULL, dedupe_key TEXT NOT NULL, pid INTEGER, process_create_time REAL,
+        title TEXT NOT NULL, explanation TEXT NOT NULL, metric TEXT, observed_value REAL,
+        expected_value REAL, deviation REAL, confidence REAL NOT NULL, evidence_json TEXT NOT NULL,
+        investigation_id TEXT, notified_at REAL, spoken_at REAL, snoozed_until REAL, resolved_at REAL,
+        audio_blob BLOB
+    )''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_investigations_created ON investigations(created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_chat_investigation ON chat_messages(investigation_id, created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_resource_timestamp ON resource_samples(sampled_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_process_resource_identity ON process_resource_samples(pid, create_time, sampled_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_process_resource_time ON process_resource_samples(sampled_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_status_created ON alerts(status,created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_dedupe_created ON alerts(dedupe_key,created_at)')
     conn.commit(); return conn
 
 def persist_event(e: Event):
@@ -103,12 +138,16 @@ def prune_database():
     """Apply age and hard-count retention to keep local storage bounded."""
     cutoff = datetime.now(timezone.utc).timestamp() - EVENT_RETENTION_DAYS * 86400
     cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+    from .settings import get_settings
+    resource_cutoff = datetime.now(timezone.utc).timestamp() - get_settings()["resource_retention_hours"] * 3600
     c = db()
     c.execute('DELETE FROM events WHERE timestamp < ?', (cutoff_iso,))
     c.execute('DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY timestamp DESC LIMIT ?)', (MAX_EVENTS,))
     c.execute('DELETE FROM investigations WHERE id NOT IN (SELECT id FROM investigations ORDER BY created_at DESC LIMIT ?)', (MAX_INVESTIGATIONS,))
     c.execute('DELETE FROM chat_messages WHERE investigation_id NOT IN (SELECT id FROM investigations)')
     c.execute('DELETE FROM chat_messages WHERE id NOT IN (SELECT id FROM chat_messages ORDER BY created_at DESC LIMIT 20000)')
+    c.execute('DELETE FROM process_resource_samples WHERE sampled_at < ?', (resource_cutoff,))
+    c.execute('DELETE FROM resource_samples WHERE sampled_at < ?', (resource_cutoff,))
     c.commit(); c.close()
 
 def list_chat_messages(investigation_id: str, limit: int = 20):
@@ -183,12 +222,13 @@ def _review_loop():
             _review_queue.task_done()
 
 class Collector:
-    def __init__(self): self.seen={}; self.running=False; self.thread=None; self._lock=threading.Lock(); self._baseline=True; self._last_prune=0.0
+    def __init__(self): self.seen={}; self.running=False; self.thread=None; self._lock=threading.Lock(); self._baseline=True; self._last_prune=0.0; self._last_resource_sample=0.0; self._last_process_resource_sample=0.0
     def snapshot(self):
-        fresh=[]; alive=set()
+        fresh=[]; alive=set(); resource_processes=[]
         for p in psutil.process_iter(['pid','ppid','name','exe','username']):
             try:
                 d=p.info; exe=d.get('exe'); created=p.create_time(); identity=(d['pid'],created); alive.add(identity)
+                resource_processes.append(p)
                 if identity in self.seen: continue
                 self.seen[identity]=time.time()
                 # The first pass is a baseline, not a claim that existing processes just started.
@@ -207,6 +247,15 @@ class Collector:
             self.seen=dict(sorted(self.seen.items(),key=lambda pair:pair[1],reverse=True)[:MAX_SEEN_IDENTITIES])
         if time.time()-self._last_prune>3600:
             prune_database(); self._last_prune=time.time()
+        monotonic=time.monotonic()
+        from .settings import get_settings
+        resource_settings=get_settings()
+        if monotonic-self._last_resource_sample>=resource_settings["resource_interval"]:
+            include_processes=monotonic-self._last_process_resource_sample>=resource_settings["process_resource_interval"]
+            from .resources import collect_resource_sample
+            collect_resource_sample(resource_processes,include_processes=include_processes)
+            self._last_resource_sample=monotonic
+            if include_processes: self._last_process_resource_sample=monotonic
         return fresh
     def start(self):
         with self._lock:

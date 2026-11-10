@@ -14,7 +14,10 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, provider_status_code: int | None = None, http_status_code: int = 503):
+        super().__init__(message)
+        self.provider_status_code = provider_status_code
+        self.http_status_code = http_status_code
 
 
 def provider_settings() -> dict[str, Any]:
@@ -95,27 +98,37 @@ def _completion(messages: list[dict[str, str]], *, max_tokens: int = 650, json_m
         response.raise_for_status()
         content = response.json()["choices"][0]["message"].get("content")
         if not isinstance(content, str) or not content.strip():
-            raise LLMError("Groq returned an empty response. Check the configured model and try again.")
+            raise LLMError("Groq returned an empty response. Check the configured model and try again.", http_status_code=502)
         return content[:5000]
     except LLMError:
         raise
-    except httpx.TimeoutException as exc:
-        raise LLMError("Groq did not respond within 20 seconds. Try again later.") from exc
+    except httpx.TimeoutException:
+        raise LLMError("Groq did not respond within 20 seconds. Try again later.", http_status_code=503) from None
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
-        if status == 401:
-            message = "Groq rejected the API key. Check GROQ_API_KEY in .env."
-        elif status == 429:
-            message = "Groq rate limit reached. Wait briefly, then try again."
-        elif status == 400:
-            message = f"Groq rejected the request or model '{model}'. Check GROQ_MODEL against current supported models."
+        if status == 400:
+            message = "Groq rejected the request. Check the configured model and request settings."
+        elif status == 401:
+            message = "Groq rejected the API credentials. Check GROQ_API_KEY in .env."
+        elif status == 403:
+            message = "Groq denied access to this model or account. Check model permissions and account access."
         elif status == 404:
             message = f"Groq could not find model '{model}'. Update GROQ_MODEL to a currently supported model (for example, {DEFAULT_MODEL})."
+        elif status == 429:
+            message = "Groq rate limit reached. Wait briefly, then try again."
+        elif status in (500, 502, 503):
+            message = f"Groq is temporarily unavailable (HTTP {status}). Try again later."
+        elif status >= 500:
+            message = f"Groq returned a server error (HTTP {status}). Try again later."
         else:
-            message = f"Groq request failed with HTTP {status}. Check provider status and try again."
-        raise LLMError(message) from exc
-    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
-        raise LLMError("Could not complete the Groq request. Check network access and the configured model.") from exc
+            message = f"Groq rejected the request with HTTP {status}. Check provider access and try again."
+        raise LLMError(message, provider_status_code=status, http_status_code=502) from None
+    except httpx.ConnectError:
+        raise LLMError("Could not connect to Groq. Check network access and try again.", http_status_code=503) from None
+    except httpx.HTTPError:
+        raise LLMError("Could not complete the Groq request. Check network access and try again.", http_status_code=503) from None
+    except (IndexError, KeyError, ValueError, TypeError):
+        raise LLMError("Groq returned an unexpected response. Check the configured model and try again.", http_status_code=502) from None
 
 
 def _string_list(value: Any, limit: int = 8) -> list[str]:

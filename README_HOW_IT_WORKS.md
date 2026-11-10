@@ -1,0 +1,86 @@
+# ORACLE: How It Works
+
+This guide explains what ORACLE does today, how its background monitor works, how to use the application, and what would be needed to make it more proactive. For installation details, see [README.md](README.md); for lower-level process boundaries, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Does ORACLE have a daemon?
+
+**Yes.** ORACLE has a detached, user-owned monitoring daemon. It starts only when you explicitly run `mrginu` or `mrginu --dash`. It does not install a systemd unit or start automatically at boot.
+
+The daemon is separate from the API server and dashboard:
+
+- `mrginu` starts background monitoring and returns to the shell. It does not start the dashboard.
+- `mrginu --dash` starts monitoring, starts the local API and dashboard if needed, and tries to open the browser.
+- Closing the browser or restarting the API does not stop the daemon.
+- The dashboard's **Start/Pause monitoring** control starts or stops the daemon.
+- `mrginu --status` reports the daemon and managed services; `mrginu --stop` stops the daemon and only the services ORACLE started.
+
+The daemon uses a lock and a PID record that includes Linux process start-time identity. This helps ORACLE recognize its own process safely and avoid confusing a reused PID for the original daemon.
+
+## What does “watching processes” mean?
+
+While running, the daemon asks `psutil` for process snapshots on a configurable interval: 3 seconds by default, with a 0.5 second minimum. On its first pass it records a baseline, so processes already running at startup are not treated as newly launched. Later passes identify new process instances using PID and process creation time.
+
+For a newly observed process, ORACLE records available details such as its name, executable path, parent PID, and network endpoints visible at that snapshot. Separately, the daemon now records system CPU, memory, swap, root-disk use, disk I/O, network counters/throughput, and uptime every five seconds by default. It stores process resource samples every fifteen seconds for up to 64 processes with the highest observed CPU-plus-memory use; per-process samples include PID plus creation time, CPU, RSS, memory percent, threads, file descriptors where supported, and visible remote connections. These limits reduce overhead and bound database growth; processes outside the selected set are not represented in the per-process history.
+
+Local heuristic rules still check process starts for a few suspicious patterns, including executables in temporary writable locations and temporary-path processes with network connections. Matching rules produce an explainable score and reason, not a malware verdict.
+
+This is periodic user-space monitoring, **not continuous or exhaustive system telemetry**. It can miss processes that start and exit between polls, later changes made by a long-running process, and details hidden by Linux permissions. It does not currently track file changes, command-line activity, or every network connection over time. Resource charts become available only after monitoring has collected samples; ORACLE cannot reconstruct resource history from before it was started.
+
+## What happens after a suspicious signal?
+
+When a local rule gives an event a risk score of at least 35, ORACLE automatically creates a deterministic investigation and collects a limited evidence bundle using `psutil` (process details, visible network connections, and parent details). If a Groq key is configured, the investigation is queued for an optional AI review. The queue is bounded so a slow provider request does not hold up monitoring.
+
+Groq is used for investigation review and user-requested case chat. It receives an allowlisted bundle for that case; it does not receive a continuous stream of all processes, run tools, or execute commands. Its output is presented as model inference, separate from observed facts and local rules.
+
+Gnani is used for speech features, not as the monitor's decision-maker:
+
+- **Prisma STT** transcribes audio after the user records a voice command. ORACLE accepts supported investigation/inspection requests from the transcript.
+- **Timbre TTS** turns a selected investigation report into audio after the user requests it.
+- Neither service currently starts speaking on its own when the daemon detects an event. ORACLE does not currently provide a persistent spoken conversation or automatically open the microphone.
+
+## Other features in the current application
+
+- Local, explainable process heuristics work without Groq or Gnani credentials.
+- Investigations include evidence, hypotheses, confidence, unknowns, and safe follow-up suggestions.
+- Groq can provide a separate investigation assessment and answer questions about the selected case.
+- Voice recording can submit an investigation command through Gnani Prisma.
+- A report can be read aloud with Gnani Timbre.
+- Events, investigations, and case chat are stored locally in SQLite, with age and count limits.
+- The safe demo creates a clearly marked synthetic event; it does not launch a process or contact its example network address.
+- The dashboard includes monitoring controls, process and investigation lists, settings, themes, and provider status.
+- The Resource History section charts actual locally collected CPU, memory, network, and root-disk samples for supported time windows, and lists recent process resource samples.
+- ORACLE does not kill processes, delete files, or automatically remediate a finding.
+
+## How to use ORACLE
+
+After installation and setup described in [README.md](README.md):
+
+```bash
+mrginu --dash       # Start monitoring and the local dashboard
+mrginu --status     # Check daemon, API, and dashboard status
+mrginu --stop       # Stop ORACLE-managed monitoring and services
+```
+
+In the dashboard, use **Run safe demo** to explore the workflow with synthetic data. To investigate a real process, enter a PID or use the supported investigation command. You can also record a voice command from **Voice & Settings**. Select a case and choose **Read report** to request audio.
+
+Choose **Resources** to inspect recent system samples and the process samples collected since monitoring started.
+
+Set optional credentials in the project-root `.env` file:
+
+- `GROQ_API_KEY` enables AI investigation reviews and case chat; `GROQ_MODEL` can select a model.
+- `GNANI_API_KEY` enables Prisma STT and Timbre TTS.
+- Monitoring interval and SQLite retention limits can be adjusted with the `ORACLE_*` settings in `.env.example`.
+
+The API and dashboard bind to loopback (`127.0.0.1`) and the API has no user authentication. Keep them local; do not expose the API port to a network.
+
+## What ORACLE is trying to solve
+
+ORACLE aims to make local Linux security signals easier to notice and investigate. It combines lightweight background process observation, transparent local rules, a saved evidence trail, and optional AI explanations in one local-first workflow. It is an investigation aid, not a complete endpoint detection system and not proof that a process is malicious.
+
+## Resource history and alerting status
+
+The daemon now samples system resources every five seconds by default and up to 64 selected processes every fifteen seconds. The SQLite history is bounded by a 24-hour default retention period. The Resources view charts actual recorded CPU, memory, and network counters and can show sampled process history. Older history cannot be reconstructed retroactively.
+
+The Alert inbox stores local, explainable statistical observations after a per-process baseline is available. CPU deviation, material RSS growth, and persistent newly observed endpoints are supported. Alerts include baseline evidence and can be acknowledged, snoozed, or resolved. A high CPU value alone does not mean malware.
+
+Not yet implemented: process-tree change detectors, alerts linked to automatically created investigations, desktop notifications, proactive Timbre announcements, alert replay, and follow-up voice commands. Existing user-initiated Prisma transcription and Timbre report reading remain separate manual features. Groq still reviews investigation evidence; it does not get continuous telemetry. These boundaries are intentional in the current implementation and must not be mistaken for features already running.

@@ -50,3 +50,48 @@ def test_health_reports_provider_state_without_exposing_credentials(monkeypatch)
     with pytest.raises(HTTPException) as unavailable:
         main.llm_test()
     assert unavailable.value.status_code == 503
+
+
+def test_resource_timeline_validates_windows_and_returns_actual_history(monkeypatch):
+    now=__import__('time').time()
+    sample={"sampled_at":now,"timestamp":"2026-01-01T00:00:00+00:00","cpu_percent":22.0,"memory_percent":40.0}
+    monkeypatch.setattr(main.resource_history_store,"resource_history",lambda *args,**kwargs:{"samples":[sample],"processes":[],"process_history":[]})
+    response=main.resource_timeline(window="5m")
+    assert response["window"] == "5m"
+    assert response["samples"] == [sample]
+    assert response["events"] == []
+    with pytest.raises(HTTPException) as invalid:
+        main.resource_timeline(window="7d")
+    assert invalid.value.status_code == 400
+
+
+def test_alert_api_lists_and_changes_local_alert_state():
+    connection=core.db()
+    connection.execute("""INSERT INTO alerts(id,created_at,status,severity,detector_id,dedupe_key,pid,process_create_time,
+        title,explanation,confidence,evidence_json) VALUES('api-alert',1000,'new','low','test.detector','test:1',1,1,
+        'Test observation','Local evidence',0.5,'{}')""")
+    connection.commit(); connection.close()
+    assert main.read_alerts(status="new")[0]["id"] == "api-alert"
+    assert main.change_alert("api-alert", {"status":"acknowledged"})["status"] == "acknowledged"
+    with pytest.raises(HTTPException) as invalid:
+        main.change_alert("api-alert", {"status":"not-a-state"})
+    assert invalid.value.status_code == 400
+
+
+def test_groq_endpoint_returns_sanitized_provider_error_without_stack_details(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "test_connection",
+        lambda: (_ for _ in ()).throw(
+            main.LLMError("Groq denied access to this model or account.", provider_status_code=403, http_status_code=502)
+        ),
+    )
+
+    with pytest.raises(HTTPException) as response:
+        main.llm_test()
+
+    assert response.value.status_code == 502
+    assert response.value.headers["X-Provider-Status"] == "403"
+    assert response.value.detail == "Groq denied access to this model or account."
+    assert "Authorization" not in response.value.detail
+    assert "Traceback" not in response.value.detail
