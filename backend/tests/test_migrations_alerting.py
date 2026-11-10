@@ -21,7 +21,9 @@ def test_existing_investigation_and_alert_tables_gain_link_and_voice_columns(tmp
     investigation_columns={row["name"] for row in migrated.execute("PRAGMA table_info(investigations)")}
     alert_columns={row["name"] for row in migrated.execute("PRAGMA table_info(alerts)")}
     assert "event_id" in investigation_columns
-    assert {"event_id","spoken_attempts"} <= alert_columns
+    assert {"event_id","spoken_attempts","notification_attempts","notification_retry_at",
+            "playback_attempts","delivery_retry_at","played_at","synthetic"} <= alert_columns
     assert migrated.execute("SELECT id FROM investigations WHERE id='old-investigation'").fetchone()
     assert migrated.execute("SELECT id FROM alerts WHERE id='old-alert'").fetchone()
+    assert migrated.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daemon_worker_status'").fetchone()
     migrated.close()

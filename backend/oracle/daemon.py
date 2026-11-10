@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
@@ -34,13 +35,22 @@ def main() -> int:
     try:
         connection = db()
         connection.close()
-        from .alerting import start_workers
+        from .alerting import ensure_workers, start_workers
         start_workers()
         collector.start()
+        last_worker_check=0.0
         while not stop_event.wait(0.5):
-            pass
+            now=time.monotonic()
+            if now-last_worker_check>=2.0:
+                try:ensure_workers()
+                except Exception:logging.getLogger(__name__).exception("Alert worker supervision failed")
+                last_worker_check=now
     finally:
         collector.stop()
+        try:
+            from .alerting import stop_workers
+            stop_workers()
+        except Exception:logging.getLogger(__name__).exception("Alert workers did not stop cleanly")
         try:
             current = json.loads(DAEMON_FILE.read_text(encoding="utf-8"))
             if current.get("pid") == pid and current.get("start_ticks") == record["start_ticks"]:

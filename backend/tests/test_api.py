@@ -43,6 +43,8 @@ def test_health_reports_provider_state_without_exposing_credentials(monkeypatch)
     monkeypatch.setattr(main, 'daemon_status', lambda: {'running': False, 'pid': None})
     data=main.health()
     assert data['monitoring'] is False
+    assert data['alert_delivery']['workers']['spoken-alert']['state']=='no_heartbeat' or data['alert_delivery']['workers']['spoken-alert']['state']=='daemon_stopped'
+    assert data['alert_delivery']['database_path']==str(core.DB_PATH.resolve())
     assert data['reasoning']['configured'] is True
     assert data['gnani']['configured'] is True
     assert 'groq-test-secret' not in str(data) and 'gnani-test-secret' not in str(data)

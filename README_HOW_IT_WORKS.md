@@ -49,7 +49,8 @@ Gnani is used for speech features, not as the monitor's decision-maker:
 - A report can be read aloud with Gnani Timbre.
 - Events, investigations, and case chat are stored locally in SQLite, with age and count limits.
 - Medium-or-higher resource alerts can automatically link to one investigation; the relationship is protected against duplicate worker execution and PID reuse.
-- Linux desktop notifications can be delivered while the dashboard is closed. Optional Timbre announcements use a bounded daemon queue and have local mute/threshold controls.
+- Linux desktop notifications and optional Timbre announcements run in separate daemon workers while the dashboard is closed. Timbre WAV audio is automatically played with `pw-play`, `aplay`, or `paplay`; a private temporary file is removed when playback ends.
+- Delivery state is persisted with each alert. Queue saturation and interrupted daemon work are recovered from SQLite; failures receive bounded retries, and cooldowns are consumed only after notification delivery or audio playback succeeds.
 - Alert replay serves audio generated for that alert; it does not make another provider request.
 - Settings for collection, detection sensitivity, severity thresholds, notification/speech preferences, cooldown, and Groq reviews are saved through the backend in SQLite.
 - The safe demo creates a clearly marked synthetic event; it does not launch a process or contact its example network address.
@@ -67,7 +68,7 @@ mrginu --status     # Check daemon, API, and dashboard status
 mrginu --stop       # Stop ORACLE-managed monitoring and services
 ```
 
-In the dashboard, use **Run safe demo** to explore the workflow with synthetic data. To investigate a real process, enter a PID or use the supported investigation command. In **Voice & Settings**, deliberately record a request, review the transcription, and click **Confirm voice command** to continue. Choose **Read report** for interactive TTS; enable spoken alert preferences there to opt into queued alert speech.
+In the dashboard, use **Run safe demo** to explore the investigation workflow with synthetic data. The Alert inbox **Send safe alert test** action creates a synthetic HIGH alert and sends it through the daemon's normal delivery workers. It never selects a PID, starts a process, or creates a network connection; it is marked as a test and limited to one per minute. Enable desktop notifications and spoken Timbre alerts in **Voice & Settings**; speech is disabled by default. To investigate a real process, enter a PID or use the supported investigation command. For voice commands, deliberately record, review the transcription, and click **Confirm voice command**. Choose **Read report** for interactive TTS.
 
 Choose **Resources** to inspect recent system samples and the process samples collected since monitoring started.
 

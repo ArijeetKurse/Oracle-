@@ -1,6 +1,6 @@
 import pytest
 
-from oracle import core, resources, settings
+from oracle import alerting, core, resources, settings
 
 
 @pytest.fixture(autouse=True)
@@ -16,4 +16,5 @@ def isolated_sqlite_database(tmp_path, monkeypatch):
     core.collector._last_process_resource_sample = 0
     resources.reset_sampler_state_for_tests()
     settings.reset_cache_for_tests()
+    alerting.reset_workers_for_tests()
     yield

@@ -35,7 +35,7 @@ class ChatQuestion(BaseModel): question:str = Field(min_length=1,max_length=1200
 def health():
     key=bool(os.getenv('GNANI_API_KEY')); daemon=daemon_status(); llm=provider_settings(); latest=resource_history_store.latest_resource_sample()
     summary={name:latest.get(name) for name in ('timestamp','cpu_percent','memory_percent','memory_used','memory_total','network_recv_bps','network_sent_bps')} if latest else None
-    return {'status':'running','pid':os.getpid(),'monitoring':daemon['running'],'monitoring_pid':daemon['pid'],'collector':f'psutil process snapshots ({POLL_INTERVAL:g}s interval)','resources':summary,'gnani':{'configured':key,'provider':'Gnani Speech API','prisma':'configured' if key else 'needs GNANI_API_KEY','timbre':'configured' if key else 'needs GNANI_API_KEY'},'reasoning':llm}
+    return {'status':'running','pid':os.getpid(),'monitoring':daemon['running'],'monitoring_pid':daemon['pid'],'collector':f'psutil process snapshots ({POLL_INTERVAL:g}s interval)','resources':summary,'alert_delivery':alerting.worker_status(daemon['pid']),'gnani':{'configured':key,'provider':'Gnani Speech API','prisma':'configured' if key else 'needs GNANI_API_KEY','timbre':'configured' if key else 'needs GNANI_API_KEY'},'reasoning':llm}
 
 @app.get('/api/resources')
 def resource_timeline(window:str='15m',pid:int|None=None,create_time:float|None=None):
@@ -64,6 +64,24 @@ def read_alerts(status:str|None=None,severity:str|None=None,pid:int|None=None,li
     if status is not None and status not in {'new','acknowledged','snoozed','resolved'}: raise HTTPException(400,'Invalid alert status.')
     if severity is not None and severity not in {'info','low','medium','high','critical'}: raise HTTPException(400,'Invalid severity.')
     return alert_store.list_alerts(status=status,severity=severity,pid=pid,limit=limit)
+
+@app.post('/api/alerts/test')
+def create_alert_delivery_test():
+    """Queue a safe synthetic HIGH alert through normal local delivery workers."""
+    if not daemon_status()['running']:
+        raise HTTPException(503,'Start ORACLE monitoring first; the daemon owns automatic alert delivery.')
+    try:alert=alert_store.create_synthetic_test_alert()
+    except RuntimeError as exc:raise HTTPException(429,str(exc)) from None
+    preferences=app_settings.get_settings()
+    return {'alert':alert,'delivery':{'desktop_notifications':preferences['desktop_notifications'],
+        'spoken_alerts':preferences['spoken_alerts'] and not preferences['voice_muted'],
+        'note':'Spoken delivery also requires GNANI_API_KEY and an available desktop WAV player.'}}
+
+@app.get('/api/alerts/{alert_id}/delivery')
+def alert_delivery_status(alert_id:str):
+    result=alerting.delivery_status(alert_id)
+    if result is None:raise HTTPException(404,'Alert not found.')
+    return result
 
 @app.get('/api/alerts/{alert_id}/audio')
 def alert_audio(alert_id:str):

@@ -118,7 +118,7 @@ def list_alerts(*, status: str | None = None, severity: str | None = None, pid: 
     for column, value in (("status", status), ("severity", severity), ("pid", pid)):
         if value is not None: clauses.append(f"{column}=?"); values.append(value)
     if since is not None: clauses.append("created_at>=?"); values.append(since)
-    sql = "SELECT id,created_at,status,severity,detector_id,dedupe_key,pid,process_create_time,title,explanation,metric,observed_value,expected_value,deviation,confidence,evidence_json,event_id,investigation_id,notified_at,spoken_at,snoozed_until,resolved_at FROM alerts" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at DESC LIMIT ?"
+    sql = "SELECT id,created_at,status,severity,detector_id,dedupe_key,pid,process_create_time,title,explanation,metric,observed_value,expected_value,deviation,confidence,evidence_json,event_id,investigation_id,notified_at,spoken_at,played_at,synthetic,snoozed_until,resolved_at FROM alerts" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY created_at DESC LIMIT ?"
     values.append(max(1, min(500, limit)))
     conn = core.db()
     try:
@@ -128,6 +128,26 @@ def list_alerts(*, status: str | None = None, severity: str | None = None, pid: 
             item = dict(row); item["evidence"] = json.loads(item.pop("evidence_json")); output.append(item)
         return output
     finally: conn.close()
+
+
+def create_synthetic_test_alert(*, cooldown_seconds:int=60) -> dict:
+    """Persist a clearly marked HIGH test alert without inspecting or starting a process."""
+    now=time.time();conn=core.db()
+    try:
+        previous=conn.execute("SELECT created_at FROM alerts WHERE synthetic=1 ORDER BY created_at DESC LIMIT 1").fetchone()
+        if previous and now-float(previous["created_at"])<cooldown_seconds:
+            raise RuntimeError(f"A synthetic alert test was created recently; try again in {max(1,int(cooldown_seconds-(now-float(previous['created_at']))))} seconds.")
+        alert_id=str(uuid.uuid4())
+        evidence={"synthetic":True,"process_name":"ORACLE safe alert test","process_state_modified":False,
+                  "external_network_connections":False,"description":"Synthetic delivery test only; no real process was inspected."}
+        conn.execute("""INSERT INTO alerts(id,created_at,status,severity,detector_id,dedupe_key,pid,process_create_time,
+            title,explanation,confidence,evidence_json,synthetic)
+            VALUES(?,?, 'new','high','oracle.synthetic_alert_test',?,NULL,NULL,?,?,1.0,?,1)""",
+            (alert_id,now,f"synthetic-test:{alert_id}","Synthetic HIGH alert test",
+             "This is a synthetic ORACLE alert-delivery test, not a real threat. No process or external network was touched.",json.dumps(evidence)))
+        conn.commit()
+    finally:conn.close()
+    return next(item for item in list_alerts(limit=500) if item["id"]==alert_id)
 
 
 def update_alert(alert_id: str, status: str, *, snooze_seconds: int = 3600) -> dict | None:

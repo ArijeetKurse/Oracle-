@@ -111,16 +111,29 @@ def db():
         detector_id TEXT NOT NULL, dedupe_key TEXT NOT NULL, pid INTEGER, process_create_time REAL,
         title TEXT NOT NULL, explanation TEXT NOT NULL, metric TEXT, observed_value REAL,
         expected_value REAL, deviation REAL, confidence REAL NOT NULL, evidence_json TEXT NOT NULL,
-        event_id TEXT, investigation_id TEXT, notified_at REAL, spoken_at REAL, spoken_attempts INTEGER NOT NULL DEFAULT 0,
+        event_id TEXT, investigation_id TEXT, notified_at REAL, notification_attempts INTEGER NOT NULL DEFAULT 0,
+        notification_retry_at REAL, spoken_at REAL, spoken_attempts INTEGER NOT NULL DEFAULT 0,
+        playback_attempts INTEGER NOT NULL DEFAULT 0, delivery_retry_at REAL, played_at REAL,
+        synthetic INTEGER NOT NULL DEFAULT 0,
         snoozed_until REAL, resolved_at REAL,
         audio_blob BLOB
     )''')
     alert_columns={row['name'] for row in conn.execute('PRAGMA table_info(alerts)').fetchall()}
     if 'event_id' not in alert_columns: conn.execute('ALTER TABLE alerts ADD COLUMN event_id TEXT')
     if 'spoken_attempts' not in alert_columns: conn.execute('ALTER TABLE alerts ADD COLUMN spoken_attempts INTEGER NOT NULL DEFAULT 0')
+    for name, declaration in {
+        'notification_attempts':'INTEGER NOT NULL DEFAULT 0', 'notification_retry_at':'REAL',
+        'playback_attempts':'INTEGER NOT NULL DEFAULT 0', 'delivery_retry_at':'REAL',
+        'played_at':'REAL', 'synthetic':'INTEGER NOT NULL DEFAULT 0',
+    }.items():
+        if name not in alert_columns: conn.execute(f'ALTER TABLE alerts ADD COLUMN {name} {declaration}')
     conn.execute('''CREATE TABLE IF NOT EXISTS provider_state (
         provider TEXT PRIMARY KEY, lock_until REAL NOT NULL DEFAULT 0,
         next_allowed_at REAL NOT NULL DEFAULT 0, updated_at REAL NOT NULL DEFAULT 0
+    )''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS daemon_worker_status (
+        name TEXT PRIMARY KEY, pid INTEGER NOT NULL, state TEXT NOT NULL,
+        heartbeat_at REAL NOT NULL, last_error TEXT
     )''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_investigations_created ON investigations(created_at)')
@@ -131,6 +144,8 @@ def db():
     conn.execute('CREATE INDEX IF NOT EXISTS idx_process_resource_time ON process_resource_samples(sampled_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_status_created ON alerts(status,created_at)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_dedupe_created ON alerts(dedupe_key,created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_notification_pending ON alerts(notified_at,notification_retry_at,created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_alert_speech_pending ON alerts(played_at,delivery_retry_at,created_at)')
     conn.commit(); return conn
 
 def persist_event(e: Event):
